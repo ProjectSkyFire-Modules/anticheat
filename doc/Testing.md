@@ -50,6 +50,22 @@ type alongside any report. Reports omit chat contents, credentials and IPs.
 - With persistence disabled, confirm no INSERTs occur. A temporary database
   outage must not block movement; failures should appear in the SQL log.
 
+## Client-clock reports and session overview
+
+- Merge the new template keys and serial `2026100602`, set
+  `Anticheat.ClientClock=1`, then reload. Status must show it enabled. Allow login
+  grace and at least one full clock window before expecting any measurement.
+- Play normally with stable and variable latency. No clock reports should occur.
+  Repeat teleport, taxi and relog tests; each must reset the clock baseline.
+- Standalone tests cover accelerated timestamps, 32-bit wrap and batched timing.
+  Do not enable enforcement based on the new detector; none is implemented.
+- Run `.anticheat top` in game and `anticheat top` in console. Verify descending
+  totals, deterministic GUID order for ties, and at most ten current-session
+  entries. Clearing a session or logging out must remove its reports from this
+  view without removing database history. Ordinary accounts must be denied.
+- Verify persisted clock reports display as `client-clock` in history. Their
+  detector ID is 3; old IDs and rows must remain unchanged.
+
 Before adding enforcement, the module needs broader client testing, an explicit
 correction strategy, a retention policy, tighter authoritative movement
 permissions, and review of transport/vehicle and forced movement edge cases.

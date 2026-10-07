@@ -3,6 +3,7 @@
 * See LICENSE.md file for Copyright information
 */
 #include "../src/MovementMonitor.h"
+#include "../src/ClientClockMonitor.h"
 #include "../src/ModuleConfig.h"
 #include "../src/ReportValues.h"
 #include <cstdlib>
@@ -20,6 +21,27 @@ void Require(bool success, char const* message)
 
 int main()
 {
+    SkyFireAnticheat::ClientClockMonitor normalClock;
+    SkyFireAnticheat::ClientClockMonitor fastClock;
+    SkyFireAnticheat::ClientClockMonitor wrappedClock;
+    bool clockDetected = false;
+    for (std::uint32_t i = 0; i <= 30; ++i)
+    {
+        Require(!normalClock.Observe(i * 1000, i * 1000, 5000, 10000, 1.5, 2000), "normal clock");
+        Require(!wrappedClock.Observe(i * 1000, 0xFFFFF000u + i * 1000, 5000, 10000, 1.5, 2000), "32-bit client clock wrap");
+        clockDetected = fastClock.Observe(i * 1000, i * 3000, 5000, 10000, 1.5, 2000) || clockDetected;
+    }
+    Require(clockDetected, "accelerated client clock");
+    normalClock.Reset();
+    Require(!normalClock.Observe(100000, 500000, 5000, 10000, 1.5, 2000), "clock reset baseline");
+    Require(!normalClock.Observe(120000, 900000, 5000, 10000, 1.5, 2000), "clock long-gap reset");
+    Require(!normalClock.Observe(119000, 0, 5000, 10000, 1.5, 2000), "server clock regression");
+    SkyFireAnticheat::ClientClockMonitor batchedClock;
+    batchedClock.Observe(0, 0, 5000, 10000, 1.5, 2000);
+    for (std::uint32_t i = 1; i <= 10; ++i)
+        Require(!batchedClock.Observe(i * 1000, i * 1000 + (i % 2 ? 1000 : 0), 5000, 10000, 1.5, 2000), "clock jitter tolerance");
+    Require(!batchedClock.Observe(11000, 0, 5000, 10000, 1.5, 2000), "backward client clock rebases");
+
     using SkyFireAnticheat::CheckConfigVersion;
     using SkyFireAnticheat::ConfigCompatibility;
     Require(CheckConfigVersion(0) == ConfigCompatibility::Outdated, "missing config serial");

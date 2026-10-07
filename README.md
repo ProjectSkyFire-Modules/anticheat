@@ -55,6 +55,11 @@ removes the feature; retained reports remain available in the character database
 - Optional fly and water-walking flags are compared with aura authorization.
   These experimental checks default off: script-granted abilities without a
   corresponding aura may trigger reports.
+- Optional client-clock acceleration monitoring compares elapsed client time
+  against a server monotonic-time window. It tolerates 32-bit timestamp wrap and
+  batching, and resets on long gaps, backward timestamps and movement exemptions.
+  Enable `Anticheat.ClientClock=1` to test it. It defaults off pending live testing;
+  it never increases the allowed movement budget or rejects a packet.
 - Reports are rate-limited independently per player and detector. Counts are
   per login session and saturate rather than overflowing. Logout clears them;
   configuration reload resets movement baselines while retaining counts.
@@ -64,7 +69,7 @@ removes the feature; retained reports remain available in the character database
 No packet rejection, teleport correction, jail, kick or ban is performed. A report
 is evidence to investigate, not proof of cheating. Speed checks use a conservative
 ceiling and do not detect every movement exploit: brief bursts within slack,
-vertical displacement, client clock manipulation, collision bypass, manipulated
+vertical displacement, backward/reset clock manipulation, collision bypass, manipulated
 transport membership, controlled creatures, battleground boundaries, and movement
 during exemption windows need further work. Server flight capability currently
 raises the speed ceiling; it is not a separate authorization validator.
@@ -72,7 +77,7 @@ raises the speed ceiling; it is not a separate authorization validator.
 ## Commands
 
 Commands require administrator security and the existing `server info` RBAC
-permission. Console can run status and history; player/clear require a session.
+permission. Console can run status, history and top; player/clear require a session.
 
 | Command | Result |
 | --- | --- |
@@ -80,6 +85,7 @@ permission. Console can run status and history; player/clear require a session.
 | `.anticheat player` | Reports for the selected online player, or yourself |
 | `.anticheat clear` | Clear that player's session reports and reset its baseline; preserve database history |
 | `.anticheat history <GUID>` | Latest 10 persisted reports for a character's numeric low GUID, including offline characters |
+| `.anticheat top` | Top ten current-session report totals, with per-detector counts; available in console |
 
 ## Optional persistent history
 
@@ -95,7 +101,8 @@ The module queues one INSERT per cooldown-qualified report using the core's
 asynchronous database worker. The movement callback does not wait for SQL. Each
 row records the event's UTC Unix timestamp, character/account IDs, map, detector,
 opcode, position (integer thousandths of a yard) and latency. It contains no IP,
-chat text or credentials. Detector IDs are stable: 0=speed, 1=fly, 2=waterwalk.
+chat text or credentials. Detector IDs are stable: 0=speed, 1=fly, 2=waterwalk,
+3=client-clock. The clock detector uses the existing schema; no new SQL is needed.
 
 History survives relog and worldserver restart, but pending asynchronous writes
 can be lost in a crash or database outage. Check the core SQL log for write
@@ -120,6 +127,8 @@ ctest --test-dir tests/build -C Release --output-on-failure
 
 Tests cover normal running, sustained excessive speed, batching, zero elapsed
 time, resets, stalls, clock regression, invalid samples and bounded idle credit.
+Additional cases cover client-clock acceleration, timestamp wraparound, batching,
+report argument boundaries and configuration serial compatibility.
 They do not validate the worldserver adapter or packet behavior; build the module
 with the core and follow [the live test checklist](doc/Testing.md).
 

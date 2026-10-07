@@ -3,6 +3,7 @@
 * See LICENSE.md file for Copyright information
 */
 #include "MovementMonitor.h"
+#include "ClientClockMonitor.h"
 #include "ModuleConfig.h"
 #include "ReportValues.h"
 #include "Chat.h"
@@ -28,8 +29,8 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
 uint64 Now() { return uint64(std::chrono::duration_cast<Milliseconds>(Clock::now().time_since_epoch()).count()); }
 
-enum Detection { Speed, Fly, WaterWalk, DetectionCount };
-char const* const Names[] = { "speed", "fly", "waterwalk" };
+enum Detection { Speed, Fly, WaterWalk, ClientClock, DetectionCount };
+char const* const Names[] = { "speed", "fly", "waterwalk", "client-clock" };
 
 bool IsPositionOpcode(uint16 opcode)
 {
@@ -75,6 +76,10 @@ struct Settings
     bool fly = false;
     bool waterWalk = false;
     bool database = false;
+    bool clientClock = false;
+    double clockRatio = 1.5;
+    uint32 clockWindow = 10000;
+    uint32 clockSlack = 2000;
     double multiplier = 1.3;
     double slack = 10;
     uint32 grace = 5000;
@@ -86,6 +91,7 @@ struct Settings
 struct State
 {
     SkyFireAnticheat::MovementMonitor movement;
+    SkyFireAnticheat::ClientClockMonitor clock;
     uint64 graceUntil = 0;
     std::array<uint32, DetectionCount> reports{};
     std::array<uint64, DetectionCount> lastReport{};
@@ -145,6 +151,10 @@ public:
         next.gap = ReadDuration("Anticheat.MaximumGapMs", 5000, 1000, 60000);
         next.latency = ReadDuration("Anticheat.MaximumLatencyMs", 1000, 100, 10000);
         next.cooldown = ReadDuration("Anticheat.ReportCooldownMs", 10000, 1000, 600000);
+        next.clientClock = sConfigMgr->GetBoolDefault("Anticheat.ClientClock", false);
+        next.clockRatio = ReadNumber("Anticheat.ClockRatio", 1.5f, 1.1, 5.0);
+        next.clockWindow = ReadDuration("Anticheat.ClockWindowMs", 10000, 5000, 60000);
+        next.clockSlack = ReadDuration("Anticheat.ClockSlackMs", 2000, 500, 10000);
         if (loaded && sConfigMgr->GetBoolDefault("Anticheat.DatabaseReports", false))
         {
             QueryResult schema = CharacterDatabase.Query(
@@ -161,6 +171,7 @@ public:
             for (auto& entry : Players)
             {
                 entry.second.movement.Reset();
+                entry.second.clock.Reset();
                 entry.second.graceUntil = Now() + next.grace;
             }
         }
@@ -176,6 +187,7 @@ void Grace(Player* player, uint32 duration = 0)
     if (itr == Players.end())
         return;
     itr->second.movement.Reset();
+    itr->second.clock.Reset();
     itr->second.graceUntil = std::max(itr->second.graceUntil, Now() + std::max(duration, Options.grace));
 }
 
@@ -236,6 +248,7 @@ public:
                 player->GetSession()->GetLatency() > Options.latency)
             {
                 state.movement.Reset();
+                state.clock.Reset();
                 state.graceUntil = now + Options.grace;
                 return;
             }
@@ -256,7 +269,9 @@ public:
                     (movement.flags & (MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY)),
                 Options.waterWalk && !player->HasAuraType(SPELL_AURA_WATER_WALK) &&
                     !player->HasAuraType(SPELL_AURA_GHOST) && !player->IsGameMaster() &&
-                    (movement.flags & MOVEMENTFLAG_WATERWALKING)
+                    (movement.flags & MOVEMENTFLAG_WATERWALKING),
+                Options.clientClock && state.clock.Observe(now, movement.time, Options.gap,
+                    Options.clockWindow, Options.clockRatio, Options.clockSlack)
             };
             for (unsigned i = 0; i < DetectionCount; ++i)
                 if (suspicious[i] && (!state.lastReport[i] || now - state.lastReport[i] >= Options.cooldown))
@@ -298,6 +313,7 @@ public:
             { "status", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, &Status, "" },
             { "player", rbac::RBAC_PERM_COMMAND_SERVER_INFO, false, &Reports, "" },
             { "history", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, &History, "" },
+            { "top", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, &Top, "" },
             { "clear", rbac::RBAC_PERM_COMMAND_SERVER_INFO, false, &Clear, "" }
         };
         return { { "anticheat", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, NULL, "", commands } };
@@ -326,6 +342,42 @@ public:
             uint32(options.fly), uint32(options.waterWalk), uint32(options.database));
         handler->PSendSysMessage("Module config serial: installed=%u expected=%u.",
             options.configVersion, SkyFireAnticheat::ConfigVersion);
+        handler->PSendSysMessage("Client clock detection=%u (report-only).", uint32(options.clientClock));
+        return true;
+    }
+    static bool Top(ChatHandler* handler, char const* /*args*/)
+    {
+        if (!Admin(handler))
+            return false;
+        struct Row
+        {
+            uint64 guid;
+            uint64 total;
+            std::array<uint32, DetectionCount> reports;
+        };
+        std::vector<Row> rows;
+        {
+            std::lock_guard<std::mutex> lock(Mutex);
+            for (auto const& entry : Players)
+            {
+                uint64 total = 0;
+                for (uint32 count : entry.second.reports)
+                    total += count;
+                if (total)
+                    rows.push_back({entry.first, total, entry.second.reports});
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](Row const& a, Row const& b)
+        {
+            return a.total != b.total ? a.total > b.total : a.guid < b.guid;
+        });
+        handler->SendSysMessage("Current-session reports only; counts are not a cheating verdict.");
+        if (rows.empty())
+            handler->SendSysMessage("No current-session reports.");
+        for (std::size_t i = 0; i < std::min(rows.size(), std::size_t(10)); ++i)
+            handler->PSendSysMessage("GUID=%u total=" UI64FMTD " speed=%u fly=%u waterwalk=%u clock=%u",
+                GUID_LOPART(rows[i].guid), rows[i].total, rows[i].reports[Speed], rows[i].reports[Fly],
+                rows[i].reports[WaterWalk], rows[i].reports[ClientClock]);
         return true;
     }
     static bool History(ChatHandler* handler, char const* args)
@@ -391,8 +443,8 @@ public:
                 itr->second.graceUntil = Now() + Options.grace;
             }
         }
-        handler->PSendSysMessage("%s: speed=%u fly=%u waterwalk=%u%s", player->GetName().c_str(),
-            counts[Speed], counts[Fly], counts[WaterWalk], clear ? " (cleared)" : "");
+        handler->PSendSysMessage("%s: speed=%u fly=%u waterwalk=%u clock=%u%s", player->GetName().c_str(),
+            counts[Speed], counts[Fly], counts[WaterWalk], counts[ClientClock], clear ? " (cleared)" : "");
         return true;
     }
     static bool Reports(ChatHandler* handler, char const*) { return PlayerReport(handler, false); }
