@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="assets/skyfire_transp.png" alt="Project SkyFire logo" width="520">
+</p>
+
 # SkyFire Anticheat module
+
+[Project SkyFire](https://www.projectskyfire.org/) · [GPL 3.0](LICENSE.md) · [Copyright and attribution](COPYRIGHT.md)
 
 Optional, report-only movement monitoring for Project SkyFire 5.4.8. Requires
 SkyFire_548 main commit `79bd1b3fdf` or later with the movement module hooks.
@@ -18,8 +24,25 @@ Copy the installed `anticheat.conf.dist` to `anticheat.conf` beside the actual
 `worldserver.conf` supplied to worldserver. Restart worldserver or use the core's
 configuration reload command. Missing config disables monitoring.
 
-The module needs no SQL updates. Removing it and reconfiguring the core removes
-the feature; no gameplay tables or core configuration entries are altered.
+### Module configuration serial
+
+`Anticheat.ConfVersion` is checked by the module at startup and on configuration
+reload. It is independent of worldserver's `ConfVersion`; the module never sets
+or changes the core serial. `.anticheat status` displays installed and expected
+module serials.
+
+A missing, invalid or older serial produces an update warning. A newer serial
+warns that the module binary and config may not match. Like the core's version
+check, these warnings do not stop startup, disable monitoring or rewrite files.
+Merge changes from `anticheat.conf.dist`, preserve your settings, then update the
+serial and reload. Merely changing the serial does not update a configuration.
+
+Module maintainers must bump the `YYYYMMDDNN` serial in `src/ModuleConfig.h` and
+`conf/anticheat.conf.dist` together when changing the configuration template.
+
+The default log-only mode needs no SQL updates. Optional database history requires
+the module schema described below. Removing the module and reconfiguring the core
+removes the feature; retained reports remain available in the character database.
 
 ## Current behavior
 
@@ -49,13 +72,41 @@ raises the speed ceiling; it is not a separate authorization validator.
 ## Commands
 
 Commands require administrator security and the existing `server info` RBAC
-permission. Console can run `anticheat status`; player commands require a session.
+permission. Console can run status and history; player/clear require a session.
 
 | Command | Result |
 | --- | --- |
 | `.anticheat status` | Enabled state, enabled detectors and tracked player count |
 | `.anticheat player` | Reports for the selected online player, or yourself |
-| `.anticheat clear` | Clear that player's session reports and reset its baseline |
+| `.anticheat clear` | Clear that player's session reports and reset its baseline; preserve database history |
+| `.anticheat history <GUID>` | Latest 10 persisted reports for a character's numeric low GUID, including offline characters |
+
+## Optional persistent history
+
+1. Import `sql/pending_updates/characters/create_anticheat_reports.sql` into the
+   character database. The file is idempotent and does not modify gameplay tables.
+   Module SQL is not automatically imported by the core's updater.
+2. Set `Anticheat.DatabaseReports=1` in `anticheat.conf` and reload configuration.
+3. Confirm `.anticheat status` shows `Database=1`. Missing columns or an unavailable
+   schema disable persistence and produce a startup/reload error; log-only
+   monitoring remains available.
+
+The module queues one INSERT per cooldown-qualified report using the core's
+asynchronous database worker. The movement callback does not wait for SQL. Each
+row records the event's UTC Unix timestamp, character/account IDs, map, detector,
+opcode, position (integer thousandths of a yard) and latency. It contains no IP,
+chat text or credentials. Detector IDs are stable: 0=speed, 1=fly, 2=waterwalk.
+
+History survives relog and worldserver restart, but pending asynchronous writes
+can be lost in a crash or database outage. Check the core SQL log for write
+failures. `Database=1` means the schema passed the last config-time check; it is
+not a live database health probe. History queries are explicit administrator
+operations and return at most ten rows, using the character/history index.
+
+No automatic retention or deletion is enabled. Operators should set a retention
+policy appropriate to their server and maintain the module table separately.
+Disable persistence before removing its table. Reimporting the initial SQL never
+deletes rows, and `.anticheat clear` does not delete stored evidence.
 
 ## Tests
 
@@ -77,4 +128,4 @@ with the core and follow [the live test checklist](doc/Testing.md).
 Inspired by the feature proposal in [SkyFire PR #1191](https://github.com/ProjectSkyfire/SkyFire_548/pull/1191)
 by acidmanifesto (M'Dic). The standalone implementation replaces its embedded
 manager, calculations and punitive actions rather than copying them into the core.
-Licensed under GPL v3; see [LICENSE.md](LICENSE.md).
+Licensed under GPL v3; see [LICENSE.md](LICENSE.md) and [COPYRIGHT.md](COPYRIGHT.md).

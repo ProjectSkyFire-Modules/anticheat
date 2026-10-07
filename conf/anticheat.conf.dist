@@ -1,4 +1,9 @@
+# This file is part of Project SkyFire https://www.projectskyfire.org.
+# See LICENSE.md file for Copyright information
 [worldserver]
+# Module-owned serial. Do not use the core's unprefixed ConfVersion key.
+# Merge template changes before updating this value in your installed config.
+Anticheat.ConfVersion = 2026100601
 # Copy to anticheat.conf beside worldserver.conf. No automatic punishment exists.
 Anticheat.Enable = 1
 Anticheat.CheckStaff = 0
@@ -13,3 +18,5 @@ Anticheat.GraceMs = 5000
 Anticheat.MaximumGapMs = 5000
 Anticheat.MaximumLatencyMs = 1000
 Anticheat.ReportCooldownMs = 10000
+# Optional character database history; import the module SQL before enabling.
+Anticheat.DatabaseReports = 0

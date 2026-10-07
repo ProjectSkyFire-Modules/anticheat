@@ -3,6 +3,8 @@
 * See LICENSE.md file for Copyright information
 */
 #include "../src/MovementMonitor.h"
+#include "../src/ModuleConfig.h"
+#include "../src/ReportValues.h"
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -18,6 +20,23 @@ void Require(bool success, char const* message)
 
 int main()
 {
+    using SkyFireAnticheat::CheckConfigVersion;
+    using SkyFireAnticheat::ConfigCompatibility;
+    Require(CheckConfigVersion(0) == ConfigCompatibility::Outdated, "missing config serial");
+    Require(CheckConfigVersion(-1) == ConfigCompatibility::Outdated, "negative config serial");
+    Require(CheckConfigVersion(SkyFireAnticheat::ConfigVersion - 1) == ConfigCompatibility::Outdated, "old config serial");
+    Require(CheckConfigVersion(SkyFireAnticheat::ConfigVersion) == ConfigCompatibility::Current, "matching config serial");
+    Require(CheckConfigVersion(SkyFireAnticheat::ConfigVersion + 1) == ConfigCompatibility::Newer, "newer config serial");
+    std::uint32_t guid;
+    Require(SkyFireAnticheat::ParsePositiveUint32("4294967295", guid) && guid == 4294967295u, "maximum GUID");
+    Require(SkyFireAnticheat::ParsePositiveUint32("0001", guid) && guid == 1, "leading zeros");
+    for (char const* invalid : { "", "0", "-1", "+1", "1;DELETE", "1 OR 1=1", "4294967296", "9999999999999999999999" })
+        Require(!SkyFireAnticheat::ParsePositiveUint32(invalid, guid), "reject invalid history arguments");
+    Require(!SkyFireAnticheat::ParsePositiveUint32(nullptr, guid), "null history argument");
+    Require(SkyFireAnticheat::CoordinateMilli(-12.5f) == -12500, "signed position encoding");
+    Require(SkyFireAnticheat::CoordinateMilli(std::numeric_limits<float>::max()) == std::numeric_limits<std::int32_t>::max(), "large position bounds");
+    Require(SkyFireAnticheat::CoordinateMilli(-std::numeric_limits<float>::max()) == std::numeric_limits<std::int32_t>::min(), "negative position bounds");
+    Require(SkyFireAnticheat::CoordinateMilli(std::numeric_limits<float>::infinity()) == 0, "nonfinite position");
     using SkyFireAnticheat::MovementMonitor;
     MovementMonitor normal;
     for (unsigned i = 0; i < 1000; ++i)

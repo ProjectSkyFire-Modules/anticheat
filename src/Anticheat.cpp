@@ -3,8 +3,11 @@
 * See LICENSE.md file for Copyright information
 */
 #include "MovementMonitor.h"
+#include "ModuleConfig.h"
+#include "ReportValues.h"
 #include "Chat.h"
 #include "Config.h"
+#include "DatabaseEnv.h"
 #include "Log.h"
 #include "MoveSpline.h"
 #include "Opcodes.h"
@@ -14,6 +17,7 @@
 #include "WorldSession.h"
 #include <array>
 #include <chrono>
+#include <ctime>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -64,11 +68,13 @@ bool IsPositionOpcode(uint16 opcode)
 
 struct Settings
 {
+    uint32 configVersion = 0;
     bool enabled = false;
     bool staff = false;
     bool speed = true;
     bool fly = false;
     bool waterWalk = false;
+    bool database = false;
     double multiplier = 1.3;
     double slack = 10;
     uint32 grace = 5000;
@@ -113,6 +119,21 @@ public:
         path = (slash == std::string::npos ? "" : path.substr(0, slash + 1)) + "anticheat.conf";
         bool loaded = sConfigMgr->LoadMore(path.c_str());
         Settings next;
+        if (loaded)
+            SkyFireAnticheat::ParsePositiveUint32(
+                sConfigMgr->GetStringDefault("Anticheat.ConfVersion", "0").c_str(), next.configVersion);
+        if (loaded)
+        {
+            auto compatibility = SkyFireAnticheat::CheckConfigVersion(next.configVersion);
+            if (compatibility == SkyFireAnticheat::ConfigCompatibility::Outdated)
+                SF_LOG_WARN("server.loading", "Anticheat config is outdated or missing its serial (installed %u, expected %u). "
+                    "Merge anticheat.conf.dist into %s, preserve your settings, then reload. Do not only change the serial.",
+                    next.configVersion, SkyFireAnticheat::ConfigVersion, path.c_str());
+            else if (compatibility == SkyFireAnticheat::ConfigCompatibility::Newer)
+                SF_LOG_WARN("server.loading", "Anticheat config serial %u is newer than this module (%u). "
+                    "Update the module or use its matching configuration template: %s.",
+                    next.configVersion, SkyFireAnticheat::ConfigVersion, path.c_str());
+        }
         next.enabled = loaded && sConfigMgr->GetBoolDefault("Anticheat.Enable", true);
         next.staff = sConfigMgr->GetBoolDefault("Anticheat.CheckStaff", false);
         next.speed = sConfigMgr->GetBoolDefault("Anticheat.Speed", true);
@@ -124,6 +145,16 @@ public:
         next.gap = ReadDuration("Anticheat.MaximumGapMs", 5000, 1000, 60000);
         next.latency = ReadDuration("Anticheat.MaximumLatencyMs", 1000, 100, 10000);
         next.cooldown = ReadDuration("Anticheat.ReportCooldownMs", 10000, 1000, 600000);
+        if (loaded && sConfigMgr->GetBoolDefault("Anticheat.DatabaseReports", false))
+        {
+            QueryResult schema = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() "
+                "AND table_name='mod_anticheat_reports' AND column_name IN "
+                "('id','event_time','guid','account','map','detector','opcode','x_milli','y_milli','z_milli','latency')");
+            next.database = schema && schema->Fetch()[0].GetUInt64() == 11;
+            if (!next.database)
+                SF_LOG_ERROR("anticheat", "Database history disabled: import the module character SQL and reload configuration.");
+        }
         {
             std::lock_guard<std::mutex> lock(Mutex);
             Options = next;
@@ -188,6 +219,7 @@ public:
         uint64 now = Now();
         std::array<bool, DetectionCount> emitted{};
         std::array<uint32, DetectionCount> counts{};
+        bool database = false;
         {
             std::lock_guard<std::mutex> lock(Mutex);
             if (!Options.enabled)
@@ -196,6 +228,7 @@ public:
             if (itr == Players.end())
                 return;
             State& state = itr->second;
+            database = Options.database;
             if (mover != player || !player->IsInWorld() || player->IsBeingTeleported() ||
                 player->GetTransport() || player->GetVehicle() || player->IsInFlight() ||
                 !player->movespline->Finalized() ||
@@ -238,8 +271,20 @@ public:
         // Avoid holding module state while logging. No chat content, credentials or IPs.
         for (unsigned i = 0; i < DetectionCount; ++i)
             if (emitted[i])
+            {
                 SF_LOG_WARN("anticheat", "Report-only: guid=%u detector=%s count=%u map=%u opcode=%u",
                     player->GetGUIDLow(), Names[i], counts[i], player->GetMapId(), uint32(opcode));
+                if (database)
+                    CharacterDatabase.PExecute(
+                        "INSERT INTO mod_anticheat_reports "
+                        "(event_time,guid,account,map,detector,opcode,x_milli,y_milli,z_milli,latency) "
+                        "VALUES (" UI64FMTD ",%u,%u,%u,%u,%u,%d,%d,%d,%u)",
+                        uint64(std::time(nullptr)), player->GetGUIDLow(), player->GetSession()->GetAccountId(),
+                        player->GetMapId(), i, uint32(opcode),
+                        SkyFireAnticheat::CoordinateMilli(player->GetPositionX()),
+                        SkyFireAnticheat::CoordinateMilli(player->GetPositionY()),
+                        SkyFireAnticheat::CoordinateMilli(player->GetPositionZ()), player->GetSession()->GetLatency());
+            }
     }
 };
 
@@ -252,6 +297,7 @@ public:
         static std::vector<ChatCommand> commands = {
             { "status", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, &Status, "" },
             { "player", rbac::RBAC_PERM_COMMAND_SERVER_INFO, false, &Reports, "" },
+            { "history", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, &History, "" },
             { "clear", rbac::RBAC_PERM_COMMAND_SERVER_INFO, false, &Clear, "" }
         };
         return { { "anticheat", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, NULL, "", commands } };
@@ -268,10 +314,58 @@ public:
     {
         if (!Admin(handler))
             return false;
-        std::lock_guard<std::mutex> lock(Mutex);
-        handler->PSendSysMessage("Anticheat: %s, report-only. Tracked players: %u. Speed=%u Fly=%u Waterwalk=%u.",
-            Options.enabled ? "enabled" : "disabled", uint32(Players.size()), uint32(Options.speed),
-            uint32(Options.fly), uint32(Options.waterWalk));
+        Settings options;
+        uint32 tracked;
+        {
+            std::lock_guard<std::mutex> lock(Mutex);
+            options = Options;
+            tracked = uint32(Players.size());
+        }
+        handler->PSendSysMessage("Anticheat: %s, report-only. Tracked players: %u. Speed=%u Fly=%u Waterwalk=%u. Database=%u.",
+            options.enabled ? "enabled" : "disabled", tracked, uint32(options.speed),
+            uint32(options.fly), uint32(options.waterWalk), uint32(options.database));
+        handler->PSendSysMessage("Module config serial: installed=%u expected=%u.",
+            options.configVersion, SkyFireAnticheat::ConfigVersion);
+        return true;
+    }
+    static bool History(ChatHandler* handler, char const* args)
+    {
+        if (!Admin(handler))
+            return false;
+        // Strict numeric low GUID, no names or SQL fragments. Usable for offline players.
+        uint32 guid = 0;
+        if (!SkyFireAnticheat::ParsePositiveUint32(args, guid))
+        {
+            handler->SendSysMessage("Usage: anticheat history <character low GUID>");
+            return false;
+        }
+        bool database;
+        {
+            std::lock_guard<std::mutex> lock(Mutex);
+            database = Options.database;
+        }
+        if (!database)
+        {
+            handler->SendSysMessage("Database history is disabled or its schema is unavailable.");
+            return true;
+        }
+        QueryResult result = CharacterDatabase.PQuery(
+            "SELECT event_time,detector,map,opcode,x_milli,y_milli,z_milli,latency FROM mod_anticheat_reports "
+            "WHERE guid=%u ORDER BY id DESC LIMIT 10", uint32(guid));
+        if (!result)
+        {
+            handler->SendSysMessage("No history returned. If a database error occurred, inspect the SQL log.");
+            return true;
+        }
+        do
+        {
+            Field* fields = result->Fetch();
+            uint8 detector = fields[1].GetUInt8();
+            handler->PSendSysMessage("UTC epoch=" UI64FMTD " %s map=%u opcode=%u pos=(%.3f,%.3f,%.3f) latency=%u ms",
+                fields[0].GetUInt64(), detector < DetectionCount ? Names[detector] : "unknown",
+                fields[2].GetUInt32(), uint32(fields[3].GetUInt16()), fields[4].GetInt32() / 1000.0,
+                fields[5].GetInt32() / 1000.0, fields[6].GetInt32() / 1000.0, fields[7].GetUInt32());
+        } while (result->NextRow());
         return true;
     }
     static bool PlayerReport(ChatHandler* handler, bool clear)
