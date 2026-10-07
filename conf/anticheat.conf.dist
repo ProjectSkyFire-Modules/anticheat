@@ -1,0 +1,15 @@
+[worldserver]
+# Copy to anticheat.conf beside worldserver.conf. No automatic punishment exists.
+Anticheat.Enable = 1
+Anticheat.CheckStaff = 0
+Anticheat.Speed = 1
+# Experimental aura-based checks: enable only for report-only validation.
+# Script-granted flight/waterwalking without an aura can trigger these checks.
+Anticheat.Fly = 0
+Anticheat.WaterWalk = 0
+Anticheat.SpeedMultiplier = 1.30
+Anticheat.DistanceSlack = 10.0
+Anticheat.GraceMs = 5000
+Anticheat.MaximumGapMs = 5000
+Anticheat.MaximumLatencyMs = 1000
+Anticheat.ReportCooldownMs = 10000
