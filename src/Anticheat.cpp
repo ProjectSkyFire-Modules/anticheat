@@ -232,7 +232,7 @@ public:
             if (mover != player || !player->IsInWorld() || player->IsBeingTeleported() ||
                 player->GetTransport() || player->GetVehicle() || player->IsInFlight() ||
                 !player->movespline->Finalized() ||
-                (!Options.staff && player->GetSession()->GetSecurity() > SEC_PLAYER) ||
+                (!Options.staff && player->GetSession()->GetSecurity() > AccountTypes::SEC_PLAYER) ||
                 player->GetSession()->GetLatency() > Options.latency)
             {
                 state.movement.Reset();
@@ -304,7 +304,7 @@ public:
     }
     static bool Admin(ChatHandler* handler)
     {
-        if (!handler->GetSession() || handler->GetSession()->GetSecurity() >= SEC_ADMINISTRATOR)
+        if (!handler->GetSession() || handler->GetSession()->GetSecurity() >= AccountTypes::SEC_ADMINISTRATOR)
             return true;
         handler->SendSysMessage("Anticheat commands require an administrator.");
         handler->SetSentErrorMessage(true);
