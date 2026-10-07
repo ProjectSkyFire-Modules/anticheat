@@ -8,9 +8,26 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 namespace SkyFireAnticheat
 {
+// Hex SQL literals avoid escaping through a shared MySQL connection on map threads.
+inline std::string HexEvidence(std::string const& evidence)
+{
+    static char const digits[] = "0123456789abcdef";
+    std::string hex;
+    std::size_t count = std::min(evidence.size(), std::size_t(512));
+    hex.reserve(count * 2);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        unsigned char value = static_cast<unsigned char>(evidence[i]);
+        hex += digits[value >> 4];
+        hex += digits[value & 15];
+    }
+    return hex;
+}
+
 inline bool ParsePositiveUint32(char const* text, std::uint32_t& result)
 {
     result = 0;

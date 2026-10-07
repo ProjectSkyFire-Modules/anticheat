@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS `mod_anticheat_reports` (
   `y_milli` int NOT NULL,
   `z_milli` int NOT NULL,
   `latency` int unsigned NOT NULL,
+  `evidence` varchar(512) NOT NULL DEFAULT '',
   PRIMARY KEY (`id`),
   KEY `guid_history` (`guid`,`id`),
   KEY `event_time` (`event_time`)

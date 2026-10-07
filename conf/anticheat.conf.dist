@@ -3,7 +3,7 @@
 [worldserver]
 # Module-owned serial. Do not use the core's unprefixed ConfVersion key.
 # Merge template changes before updating this value in your installed config.
-Anticheat.ConfVersion = 2026100603
+Anticheat.ConfVersion = 2026100604
 # Copy to anticheat.conf beside worldserver.conf. No automatic punishment exists.
 Anticheat.Enable = 1
 Anticheat.CheckStaff = 0
@@ -29,3 +29,16 @@ Anticheat.ClockSlackMs = 2000
 # Allow administrators to opt in with .anticheat alerts on (per login session).
 # Maximum five messages/second; queue holds 100 reports and expires after 10s.
 Anticheat.Alerts = 1
+# Experimental traversal heuristics. Report-only; enable individually for testing.
+Anticheat.Teleport = 0
+Anticheat.Jump = 0
+Anticheat.Climb = 0
+# Horizontal displacement must exceed both this threshold and the speed envelope.
+Anticheat.TeleportDistance = 50.0
+# Repeated jump must rise this far above the preceding jump and be off the ground.
+Anticheat.JumpRise = 2.0
+# Grounded ascent over at least 500ms must exceed both rise and rise/run slope.
+Anticheat.ClimbRise = 5.0
+Anticheat.ClimbSlope = 3.0
+# Minimum time between terrain queries, including jump packets; clamped to >=100ms.
+Anticheat.TerrainIntervalMs = 250

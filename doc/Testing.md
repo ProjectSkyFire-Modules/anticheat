@@ -68,11 +68,11 @@ type alongside any report. Reports omit chat contents, credentials and IPs.
 
 ## Administrator alerts and evidence
 
-- Merge config serial `2026100603`. As administrator, run `.anticheat alerts on`.
+- Merge the current config template. As administrator, run `.anticheat alerts on`.
   A second administrator who has not subscribed must receive no chat alerts.
 - Generate report-only detections. Verify chat messages identify the character
   GUID, detector, count and map; speed and clock details should appear in the
-  anticheat log. Database history should still work with the unchanged schema.
+  anticheat log. Database history should work with both basic and evidence schemas.
 - Verify `.anticheat alerts off`, logout, and global `Anticheat.Alerts=0` stop
   delivery. After relog, an administrator must opt in again. Console and ordinary
   accounts must not be able to subscribe. Remove administrator security or the
@@ -83,6 +83,35 @@ type alongside any report. Reports omit chat contents, credentials and IPs.
 - Reload while reports are queued: old queued alerts must be discarded. Confirm
   movement continues and no kick, ban, correction or synchronous SQL is introduced
   into movement handling by the alert feature.
+
+## Traversal detectors and persistent evidence (serial 2026100604)
+
+Enable one of `Anticheat.Teleport`, `Anticheat.Jump`, or `Anticheat.Climb` at a
+time. They are report-only heuristics and all default off. Keep staff checking
+enabled if using a GM test account, but use normal movement and turn off GM flight
+when testing grounded jump/climb behavior.
+
+- Test walking/running, ordinary jumping, jumping onto stairs, steep hills,
+  swimming, boats/elevators and vehicles. Test spell jumps and knockbacks,
+  flight transitions, death/resurrection, and near/far teleports. Investigate
+  any reports during authorized movement before adjusting thresholds.
+- Test multiple consecutive normal jumps: a verified landing must prevent a
+  repeated-airborne-jump report. Missing or unavailable terrain must not produce
+  climb/jump reports. Query rate stays bounded even during packet bursts.
+- Test `.anticheat player`, `.anticheat top`, alerts and history with new detector
+  IDs. Confirm all seven detector counts are displayed and `.anticheat clear`
+  resets all their baselines/counters while preserving history.
+- Run standalone traversal tests for synthetic violations. A live traversal
+  report should contain measurements and configured limits in the log.
+- Apply the evidence migration to a disposable old schema, reapply it, and verify
+  preexisting reports survive. Test fresh installation too. Run the module against
+  a basic schema to verify the fallback still writes reports without evidence.
+- With the evidence column present and config reloaded, confirm saved measurements
+  appear in history after relog and restart. Older rows have no evidence to show.
+
+The climb heuristic targets rapid steep ascent, not every climb exploit. Jump
+reports can miss events between terrain samples, and lack of a report is not proof
+that movement was valid. Teleport detection covers horizontal displacement only.
 
 Before adding enforcement, the module needs broader client testing, an explicit
 correction strategy, a retention policy, tighter authoritative movement

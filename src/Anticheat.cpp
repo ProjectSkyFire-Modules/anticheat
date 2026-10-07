@@ -4,6 +4,7 @@
 */
 #include "MovementMonitor.h"
 #include "AlertQueue.h"
+#include "TraversalMonitor.h"
 #include "ClientClockMonitor.h"
 #include "ModuleConfig.h"
 #include "ReportValues.h"
@@ -11,6 +12,7 @@
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "Log.h"
+#include "Map.h"
 #include "MoveSpline.h"
 #include "Opcodes.h"
 #include "Player.h"
@@ -24,6 +26,8 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <iomanip>
+#include <locale>
 #include <cstring>
 #include <unordered_map>
 
@@ -33,8 +37,8 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
 uint64 Now() { return uint64(std::chrono::duration_cast<Milliseconds>(Clock::now().time_since_epoch()).count()); }
 
-enum Detection { Speed, Fly, WaterWalk, ClientClock, DetectionCount };
-char const* const Names[] = { "speed", "fly", "waterwalk", "client-clock" };
+enum Detection { Speed = 0, Fly = 1, WaterWalk = 2, ClientClock = 3, Teleport = 4, Jump = 5, Climb = 6, DetectionCount = 7 };
+char const* const Names[] = { "speed", "fly", "waterwalk", "client-clock", "teleport", "jump", "climb" };
 
 bool IsPositionOpcode(uint16 opcode)
 {
@@ -80,6 +84,10 @@ struct Settings
     bool fly = false;
     bool waterWalk = false;
     bool database = false;
+    bool databaseEvidence = false;
+    bool teleport = false, jump = false, climb = false;
+    uint32 terrainInterval = 250;
+    SkyFireAnticheat::TraversalLimits traversal;
     bool clientClock = false;
     bool alerts = true;
     double clockRatio = 1.5;
@@ -97,6 +105,8 @@ struct State
 {
     SkyFireAnticheat::MovementMonitor movement;
     SkyFireAnticheat::ClientClockMonitor clock;
+    SkyFireAnticheat::TraversalMonitor traversal;
+    uint64 nextTerrainSample = 0;
     uint64 graceUntil = 0;
     std::array<uint32, DetectionCount> reports{};
     std::array<uint64, DetectionCount> lastReport{};
@@ -199,6 +209,17 @@ public:
         next.clockRatio = ReadNumber("Anticheat.ClockRatio", 1.5f, 1.1, 5.0);
         next.clockWindow = ReadDuration("Anticheat.ClockWindowMs", 10000, 5000, 60000);
         next.clockSlack = ReadDuration("Anticheat.ClockSlackMs", 2000, 500, 10000);
+        next.teleport = sConfigMgr->GetBoolDefault("Anticheat.Teleport", false);
+        next.jump = sConfigMgr->GetBoolDefault("Anticheat.Jump", false);
+        next.climb = sConfigMgr->GetBoolDefault("Anticheat.Climb", false);
+        next.terrainInterval = ReadDuration("Anticheat.TerrainIntervalMs", 250, 100, 2000);
+        next.traversal.maximumGap = next.gap;
+        next.traversal.speedMultiplier = next.multiplier;
+        next.traversal.distanceSlack = next.slack;
+        next.traversal.teleportDistance = ReadNumber("Anticheat.TeleportDistance", 50, 20, 1000);
+        next.traversal.jumpRise = ReadNumber("Anticheat.JumpRise", 2, 1, 20);
+        next.traversal.climbRise = ReadNumber("Anticheat.ClimbRise", 5, 2, 30);
+        next.traversal.climbSlope = ReadNumber("Anticheat.ClimbSlope", 3, 1.5, 10);
         if (loaded && sConfigMgr->GetBoolDefault("Anticheat.DatabaseReports", false))
         {
             QueryResult schema = CharacterDatabase.Query(
@@ -208,6 +229,16 @@ public:
             next.database = schema && schema->Fetch()[0].GetUInt64() == 11;
             if (!next.database)
                 SF_LOG_ERROR("anticheat", "Database history disabled: import the module character SQL and reload configuration.");
+            else
+            {
+                QueryResult evidence = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() "
+                    "AND table_name='mod_anticheat_reports' AND column_name='evidence' "
+                    "AND data_type='varchar' AND character_maximum_length>=512");
+                next.databaseEvidence = evidence && evidence->Fetch()[0].GetUInt64() == 1;
+                if (!next.databaseEvidence)
+                    SF_LOG_WARN("anticheat", "Detailed database evidence unavailable: apply extend_anticheat_report_evidence.sql. Basic history remains enabled.");
+            }
         }
         {
             std::lock_guard<std::mutex> lock(Mutex);
@@ -217,6 +248,8 @@ public:
             {
                 entry.second.movement.Reset();
                 entry.second.clock.Reset();
+                entry.second.traversal.Reset();
+                entry.second.nextTerrainSample = 0;
                 entry.second.graceUntil = Now() + next.grace;
             }
         }
@@ -235,6 +268,8 @@ void Grace(Player* player, uint32 duration = 0)
         return;
     itr->second.movement.Reset();
     itr->second.clock.Reset();
+    itr->second.traversal.Reset();
+    itr->second.nextTerrainSample = 0;
     itr->second.graceUntil = std::max(itr->second.graceUntil, Now() + std::max(duration, Options.grace));
 }
 
@@ -280,10 +315,38 @@ public:
         uint64 now = Now();
         std::array<bool, DetectionCount> emitted{};
         std::array<uint32, DetectionCount> counts{};
+        std::array<std::string, DetectionCount> evidence;
         bool database = false;
+        bool databaseEvidence = false;
         double distance = 0, allowance = 0;
         uint64 elapsed = 0, clockServer = 0;
         uint32 clockClient = 0;
+        bool terrainRequested = false, groundKnown = false, grounded = false;
+        {
+            std::lock_guard<std::mutex> lock(Mutex);
+            auto itr = Players.find(player->GetGUID());
+            if (Options.enabled && (Options.jump || Options.climb) && itr != Players.end() &&
+                now >= itr->second.graceUntil && now >= itr->second.nextTerrainSample &&
+                mover == player && player->IsInWorld() && !player->IsBeingTeleported() &&
+                !player->GetTransport() && !player->GetVehicle() && !player->IsInFlight() &&
+                player->movespline->Finalized() && !player->IsInWater() && !player->CanFly() &&
+                (Options.staff || player->GetSession()->GetSecurity() == AccountTypes::SEC_PLAYER) &&
+                player->GetSession()->GetLatency() <= Options.latency)
+            {
+                itr->second.nextTerrainSample = now + Options.terrainInterval;
+                terrainRequested = true;
+            }
+        }
+        // Terrain/collision queries can be costly; never perform them under the shared mutex.
+        // At most one per configured interval per eligible player, regardless of packet rate.
+        if (terrainRequested)
+        {
+            float z = player->GetPositionZ();
+            float height = player->GetMap()->GetHeight(player->GetPhaseMask(), player->GetPositionX(),
+                player->GetPositionY(), z + 2.0f, true, 50.0f);
+            groundKnown = std::isfinite(height) && height > INVALID_HEIGHT && height <= z + 1.5f;
+            grounded = groundKnown && std::abs(z - height) <= 1.5f;
+        }
         {
             std::lock_guard<std::mutex> lock(Mutex);
             if (!Options.enabled)
@@ -293,6 +356,7 @@ public:
                 return;
             State& state = itr->second;
             database = Options.database;
+            databaseEvidence = Options.databaseEvidence;
             if (mover != player || !player->IsInWorld() || player->IsBeingTeleported() ||
                 player->GetTransport() || player->GetVehicle() || player->IsInFlight() ||
                 !player->movespline->Finalized() ||
@@ -301,6 +365,8 @@ public:
             {
                 state.movement.Reset();
                 state.clock.Reset();
+                state.traversal.Reset();
+                state.nextTerrainSample = 0;
                 state.graceUntil = now + Options.grace;
                 return;
             }
@@ -314,6 +380,22 @@ public:
             double speed = std::max(player->GetSpeed(MOVE_RUN), player->GetSpeed(MOVE_SWIM));
             if (flightAura || player->CanFly())
                 speed = std::max(speed, double(player->GetSpeed(MOVE_FLIGHT)));
+            SkyFireAnticheat::TraversalResult traversal;
+            if (Options.teleport || Options.jump || Options.climb)
+            {
+                SkyFireAnticheat::TraversalSample sample;
+                sample.time = now;
+                sample.x = player->GetPositionX();
+                sample.y = player->GetPositionY();
+                sample.z = player->GetPositionZ();
+                sample.speed = speed;
+                sample.jump = opcode == MSG_MOVE_JUMP;
+                sample.groundSampled = terrainRequested;
+                sample.groundKnown = groundKnown;
+                sample.grounded = grounded;
+                sample.terrainExempt = flightAura || player->CanFly() || player->IsInWater();
+                traversal = state.traversal.Observe(sample, Options.traversal);
+            }
             bool suspicious[DetectionCount] = {
                 Options.speed && state.movement.Observe(now, player->GetPositionX(), player->GetPositionY(),
                     speed, Options.slack, Options.multiplier, Options.gap),
@@ -323,7 +405,10 @@ public:
                     !player->HasAuraType(SPELL_AURA_GHOST) && !player->IsGameMaster() &&
                     (movement.flags & MOVEMENTFLAG_WATERWALKING),
                 Options.clientClock && state.clock.Observe(now, movement.time, Options.gap,
-                    Options.clockWindow, Options.clockRatio, Options.clockSlack)
+                    Options.clockWindow, Options.clockRatio, Options.clockSlack),
+                Options.teleport && traversal.teleport,
+                Options.jump && traversal.jump,
+                Options.climb && traversal.climb
             };
             distance = state.movement.Distance();
             allowance = state.movement.Allowance();
@@ -338,6 +423,35 @@ public:
                         ++state.reports[i];
                     emitted[i] = true;
                     counts[i] = state.reports[i];
+                    std::ostringstream details;
+                    details.imbue(std::locale::classic());
+                    details << std::fixed << std::setprecision(3);
+                    switch (i)
+                    {
+                        case Speed:
+                            details << "distance_yd=" << distance << " allowance_yd=" << allowance
+                                << " elapsed_ms=" << elapsed << " speed_yd_s=" << speed;
+                            break;
+                        case ClientClock:
+                            details << "client_ms=" << clockClient << " server_ms=" << clockServer
+                                << " ratio_limit=" << Options.clockRatio << " slack_ms=" << Options.clockSlack;
+                            break;
+                        case Teleport:
+                            details << "distance_yd=" << traversal.horizontal << " limit_yd=" << traversal.allowance
+                                << " elapsed_ms=" << traversal.elapsed;
+                            break;
+                        case Jump:
+                            details << "repeat_jump_rise_yd=" << traversal.rise << " limit_yd=" << Options.traversal.jumpRise;
+                            break;
+                        case Climb:
+                            details << "rise_yd=" << traversal.rise << " slope=" << traversal.slope
+                                << " rise_limit=" << Options.traversal.climbRise << " slope_limit=" << Options.traversal.climbSlope;
+                            break;
+                        default:
+                            details << "movement_flags=" << movement.flags << " flight_aura=" << flightAura;
+                            break;
+                    }
+                    evidence[i] = details.str();
                     if (Options.alerts && !AlertSubscribers.empty())
                     {
                         std::ostringstream message;
@@ -353,22 +467,34 @@ public:
             {
                 SF_LOG_WARN("anticheat", "Report-only: guid=%u detector=%s count=%u map=%u opcode=%u",
                     player->GetGUIDLow(), Names[i], counts[i], player->GetMapId(), uint32(opcode));
-                if (i == Speed)
-                    SF_LOG_WARN("anticheat", "Speed evidence: guid=%u distance=%.3f yd allowance=%.3f yd elapsed=" UI64FMTD " ms latency=%u ms",
-                        player->GetGUIDLow(), distance, allowance, elapsed, player->GetSession()->GetLatency());
-                else if (i == ClientClock)
-                    SF_LOG_WARN("anticheat", "Clock evidence: guid=%u client=%u ms server=" UI64FMTD " ms latency=%u ms",
-                        player->GetGUIDLow(), clockClient, clockServer, player->GetSession()->GetLatency());
+                SF_LOG_WARN("anticheat", "Evidence: guid=%u detector=%s latency=%u ms %s",
+                    player->GetGUIDLow(), Names[i], player->GetSession()->GetLatency(), evidence[i].c_str());
                 if (database)
-                    CharacterDatabase.PExecute(
-                        "INSERT INTO mod_anticheat_reports "
-                        "(event_time,guid,account,map,detector,opcode,x_milli,y_milli,z_milli,latency) "
-                        "VALUES (" UI64FMTD ",%u,%u,%u,%u,%u,%d,%d,%d,%u)",
-                        uint64(std::time(nullptr)), player->GetGUIDLow(), player->GetSession()->GetAccountId(),
-                        player->GetMapId(), i, uint32(opcode),
-                        SkyFireAnticheat::CoordinateMilli(player->GetPositionX()),
-                        SkyFireAnticheat::CoordinateMilli(player->GetPositionY()),
-                        SkyFireAnticheat::CoordinateMilli(player->GetPositionZ()), player->GetSession()->GetLatency());
+                {
+                    if (databaseEvidence)
+                    {
+                        std::string hex = SkyFireAnticheat::HexEvidence(evidence[i]);
+                        CharacterDatabase.PExecute(
+                            "INSERT INTO mod_anticheat_reports "
+                            "(event_time,guid,account,map,detector,opcode,x_milli,y_milli,z_milli,latency,evidence) "
+                            "VALUES (" UI64FMTD ",%u,%u,%u,%u,%u,%d,%d,%d,%u,X'%s')",
+                            uint64(std::time(nullptr)), player->GetGUIDLow(), player->GetSession()->GetAccountId(),
+                            player->GetMapId(), i, uint32(opcode),
+                            SkyFireAnticheat::CoordinateMilli(player->GetPositionX()),
+                            SkyFireAnticheat::CoordinateMilli(player->GetPositionY()),
+                            SkyFireAnticheat::CoordinateMilli(player->GetPositionZ()), player->GetSession()->GetLatency(), hex.c_str());
+                    }
+                    else
+                        CharacterDatabase.PExecute(
+                            "INSERT INTO mod_anticheat_reports "
+                            "(event_time,guid,account,map,detector,opcode,x_milli,y_milli,z_milli,latency) "
+                            "VALUES (" UI64FMTD ",%u,%u,%u,%u,%u,%d,%d,%d,%u)",
+                            uint64(std::time(nullptr)), player->GetGUIDLow(), player->GetSession()->GetAccountId(),
+                            player->GetMapId(), i, uint32(opcode),
+                            SkyFireAnticheat::CoordinateMilli(player->GetPositionX()),
+                            SkyFireAnticheat::CoordinateMilli(player->GetPositionY()),
+                            SkyFireAnticheat::CoordinateMilli(player->GetPositionZ()), player->GetSession()->GetLatency());
+                }
             }
     }
 };
@@ -414,6 +540,8 @@ public:
         handler->PSendSysMessage("Module config serial: installed=%u expected=%u.",
             options.configVersion, SkyFireAnticheat::ConfigVersion);
         handler->PSendSysMessage("Client clock detection=%u (report-only).", uint32(options.clientClock));
+        handler->PSendSysMessage("Teleport=%u Jump=%u Climb=%u Detailed database evidence=%u.",
+            uint32(options.teleport), uint32(options.jump), uint32(options.climb), uint32(options.databaseEvidence));
         handler->PSendSysMessage("Administrator alerts available=%u; use .anticheat alerts on to subscribe.", uint32(options.alerts));
         return true;
     }
@@ -473,9 +601,9 @@ public:
         if (rows.empty())
             handler->SendSysMessage("No current-session reports.");
         for (std::size_t i = 0; i < std::min(rows.size(), std::size_t(10)); ++i)
-            handler->PSendSysMessage("GUID=%u total=" UI64FMTD " speed=%u fly=%u waterwalk=%u clock=%u",
+            handler->PSendSysMessage("GUID=%u total=" UI64FMTD " speed=%u fly=%u waterwalk=%u clock=%u teleport=%u jump=%u climb=%u",
                 GUID_LOPART(rows[i].guid), rows[i].total, rows[i].reports[Speed], rows[i].reports[Fly],
-                rows[i].reports[WaterWalk], rows[i].reports[ClientClock]);
+                rows[i].reports[WaterWalk], rows[i].reports[ClientClock], rows[i].reports[Teleport], rows[i].reports[Jump], rows[i].reports[Climb]);
         return true;
     }
     static bool History(ChatHandler* handler, char const* args)
@@ -489,10 +617,11 @@ public:
             handler->SendSysMessage("Usage: anticheat history <character low GUID>");
             return false;
         }
-        bool database;
+        bool database, databaseEvidence;
         {
             std::lock_guard<std::mutex> lock(Mutex);
             database = Options.database;
+            databaseEvidence = Options.databaseEvidence;
         }
         if (!database)
         {
@@ -500,8 +629,8 @@ public:
             return true;
         }
         QueryResult result = CharacterDatabase.PQuery(
-            "SELECT event_time,detector,map,opcode,x_milli,y_milli,z_milli,latency FROM mod_anticheat_reports "
-            "WHERE guid=%u ORDER BY id DESC LIMIT 10", uint32(guid));
+            "SELECT event_time,detector,map,opcode,x_milli,y_milli,z_milli,latency,%s FROM mod_anticheat_reports "
+            "WHERE guid=%u ORDER BY id DESC LIMIT 10", databaseEvidence ? "evidence" : "''", uint32(guid));
         if (!result)
         {
             handler->SendSysMessage("No history returned. If a database error occurred, inspect the SQL log.");
@@ -515,6 +644,9 @@ public:
                 fields[0].GetUInt64(), detector < DetectionCount ? Names[detector] : "unknown",
                 fields[2].GetUInt32(), uint32(fields[3].GetUInt16()), fields[4].GetInt32() / 1000.0,
                 fields[5].GetInt32() / 1000.0, fields[6].GetInt32() / 1000.0, fields[7].GetUInt32());
+            std::string details = fields[8].GetString();
+            if (!details.empty())
+                handler->PSendSysMessage("Evidence: %s", details.c_str());
         } while (result->NextRow());
         return true;
     }
@@ -541,8 +673,8 @@ public:
                 itr->second.graceUntil = Now() + Options.grace;
             }
         }
-        handler->PSendSysMessage("%s: speed=%u fly=%u waterwalk=%u clock=%u%s", player->GetName().c_str(),
-            counts[Speed], counts[Fly], counts[WaterWalk], counts[ClientClock], clear ? " (cleared)" : "");
+        handler->PSendSysMessage("%s: speed=%u fly=%u waterwalk=%u clock=%u teleport=%u jump=%u climb=%u%s", player->GetName().c_str(),
+            counts[Speed], counts[Fly], counts[WaterWalk], counts[ClientClock], counts[Teleport], counts[Jump], counts[Climb], clear ? " (cleared)" : "");
         return true;
     }
     static bool Reports(ChatHandler* handler, char const*) { return PlayerReport(handler, false); }

@@ -9,7 +9,7 @@
 namespace SkyFireAnticheat
 {
 // YYYYMMDDNN; increment with configuration changes and update the .conf.dist.
-constexpr std::uint32_t ConfigVersion = 2026100603;
+constexpr std::uint32_t ConfigVersion = 2026100604;
 enum class ConfigCompatibility { Outdated, Current, Newer };
 inline ConfigCompatibility CheckConfigVersion(std::int64_t version)
 {

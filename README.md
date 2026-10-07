@@ -60,6 +60,18 @@ removes the feature; retained reports remain available in the character database
   batching, and resets on long gaps, backward timestamps and movement exemptions.
   Enable `Anticheat.ClientClock=1` to test it. It defaults off pending live testing;
   it never increases the allowed movement budget or rejects a packet.
+- Optional teleport reports flag horizontal displacement exceeding both a minimum
+  distance and a server-speed/time envelope. Legitimate server teleports reset
+  the baseline through the core hook. This does not detect vertical-only warps.
+- Optional repeated-jump reports require a second rising jump and a server
+  terrain sample showing the player off the ground. Verified landing resets the
+  jump sequence; client landing/falling flags alone do not prove ground contact.
+- Optional climb reports look for steep, rapid grounded ascent over at least
+  500 ms. Flying, swimming and server-authorized movement exemptions apply.
+  Missing terrain is not evidence. Terrain queries run outside the module mutex,
+  at most once per `Anticheat.TerrainIntervalMs` per eligible player (default 250ms),
+  and are absent when jump/climb checks are disabled. All three new checks default
+  off; calibrate them on your server before relying on the reports.
 - Reports are rate-limited independently per player and detector. Counts are
   per login session and saturate rather than overflowing. Logout clears them;
   configuration reload resets movement baselines while retaining counts.
@@ -67,7 +79,9 @@ removes the feature; retained reports remain available in the character database
   core log appender if desired; the core's logger configuration controls output.
 - Speed logs include distance, remaining distance allowance, elapsed server time
   and latency. Clock logs include client/server elapsed time and latency. These
-  details accompany the summary log; the existing database row format is unchanged.
+  details accompany the summary log. With the evidence SQL migration installed,
+  measurements and thresholds are also saved with each report and displayed by
+  `.anticheat history`. Older schemas continue saving basic reports with a warning.
 - Administrators can opt into live chat alerts for their current login session.
   Delivery runs on the world thread and rechecks administrator security and RBAC.
   A shared queue holds at most 100 alerts, drops the oldest on overflow, expires
@@ -77,7 +91,7 @@ removes the feature; retained reports remain available in the character database
 No packet rejection, teleport correction, jail, kick or ban is performed. A report
 is evidence to investigate, not proof of cheating. Speed checks use a conservative
 ceiling and do not detect every movement exploit: brief bursts within slack,
-vertical displacement, backward/reset clock manipulation, collision bypass, manipulated
+vertical-only displacement, backward/reset clock manipulation, collision bypass, manipulated
 transport membership, controlled creatures, battleground boundaries, and movement
 during exemption windows need further work. Server flight capability currently
 raises the speed ceiling; it is not a separate authorization validator.
@@ -104,19 +118,27 @@ the current session and resume if monitoring and alerts are re-enabled.
 ## Optional persistent history
 
 1. Import `sql/pending_updates/characters/create_anticheat_reports.sql` into the
-   character database. The file is idempotent and does not modify gameplay tables.
-   Module SQL is not automatically imported by the core's updater.
+   character database, then `extend_anticheat_report_evidence.sql` from the same
+   directory. Both files are idempotent and preserve existing reports. The second
+   file adds the evidence column for existing installations; new installations
+   already have it. Module SQL is not automatically imported by the core updater.
 2. Set `Anticheat.DatabaseReports=1` in `anticheat.conf` and reload configuration.
 3. Confirm `.anticheat status` shows `Database=1`. Missing columns or an unavailable
    schema disable persistence and produce a startup/reload error; log-only
-   monitoring remains available.
+   monitoring remains available. `Detailed database evidence=1` confirms the
+   optional evidence column passed its config-time check. Apply the migration and
+   reload if detailed evidence is unavailable.
 
 The module queues one INSERT per cooldown-qualified report using the core's
 asynchronous database worker. The movement callback does not wait for SQL. Each
 row records the event's UTC Unix timestamp, character/account IDs, map, detector,
-opcode, position (integer thousandths of a yard) and latency. It contains no IP,
+opcode, position (integer thousandths of a yard), latency and, when supported,
+up to 512 bytes of module-generated numeric evidence. It contains no IP,
 chat text or credentials. Detector IDs are stable: 0=speed, 1=fly, 2=waterwalk,
-3=client-clock. The clock detector uses the existing schema; no new SQL is needed.
+3=client-clock, 4=teleport, 5=jump, 6=climb. Existing IDs are unchanged. Rows created
+before the evidence migration remain readable with an empty evidence field.
+Evidence uses a bounded hex SQL literal so map threads do not access a shared
+MySQL connection to escape strings; report INSERTs remain asynchronous.
 
 History survives relog and worldserver restart, but pending asynchronous writes
 can be lost in a crash or database outage. Check the core SQL log for write
@@ -145,6 +167,18 @@ Additional cases cover client-clock acceleration, timestamp wraparound, batching
 report argument boundaries and configuration serial compatibility.
 Alert tests cover capacity, burst limits, expiration, clearing and clock regression;
 evidence tests verify values from the actual detector sample.
+Traversal tests cover valid running/stairs, displacement, repeated airborne jumps,
+verified landing, forced-movement resets, grounded climb, missing terrain, stalls,
+and invalid samples. SQL tests can validate fresh installs and repeatable upgrades
+in an automatically created and removed scratch database:
+
+```sh
+python tests/test_report_schema.py --mysql mysql --host 127.0.0.1 --user root
+```
+
+Provide a password through the `MYSQL_PWD` environment variable if necessary.
+The test account needs permission to create/drop a scratch database. This test
+does not select or alter the live character database.
 They do not validate the worldserver adapter or packet behavior; build the module
 with the core and follow [the live test checklist](doc/Testing.md).
 
