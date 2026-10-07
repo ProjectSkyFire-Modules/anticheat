@@ -3,7 +3,7 @@
 [worldserver]
 # Module-owned serial. Do not use the core's unprefixed ConfVersion key.
 # Merge template changes before updating this value in your installed config.
-Anticheat.ConfVersion = 2026100602
+Anticheat.ConfVersion = 2026100603
 # Copy to anticheat.conf beside worldserver.conf. No automatic punishment exists.
 Anticheat.Enable = 1
 Anticheat.CheckStaff = 0
@@ -26,3 +26,6 @@ Anticheat.ClientClock = 0
 Anticheat.ClockRatio = 1.50
 Anticheat.ClockWindowMs = 10000
 Anticheat.ClockSlackMs = 2000
+# Allow administrators to opt in with .anticheat alerts on (per login session).
+# Maximum five messages/second; queue holds 100 reports and expires after 10s.
+Anticheat.Alerts = 1

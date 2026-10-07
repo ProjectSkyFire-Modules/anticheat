@@ -52,7 +52,7 @@ type alongside any report. Reports omit chat contents, credentials and IPs.
 
 ## Client-clock reports and session overview
 
-- Merge the new template keys and serial `2026100602`, set
+- Merge the new template keys and current serial, set
   `Anticheat.ClientClock=1`, then reload. Status must show it enabled. Allow login
   grace and at least one full clock window before expecting any measurement.
 - Play normally with stable and variable latency. No clock reports should occur.
@@ -65,6 +65,24 @@ type alongside any report. Reports omit chat contents, credentials and IPs.
   view without removing database history. Ordinary accounts must be denied.
 - Verify persisted clock reports display as `client-clock` in history. Their
   detector ID is 3; old IDs and rows must remain unchanged.
+
+## Administrator alerts and evidence
+
+- Merge config serial `2026100603`. As administrator, run `.anticheat alerts on`.
+  A second administrator who has not subscribed must receive no chat alerts.
+- Generate report-only detections. Verify chat messages identify the character
+  GUID, detector, count and map; speed and clock details should appear in the
+  anticheat log. Database history should still work with the unchanged schema.
+- Verify `.anticheat alerts off`, logout, and global `Anticheat.Alerts=0` stop
+  delivery. After relog, an administrator must opt in again. Console and ordinary
+  accounts must not be able to subscribe. Remove administrator security or the
+  server-info RBAC permission and verify delivery stops.
+- Under a report burst, chat must remain limited to five messages per second.
+  The standalone tests check bounded storage, oldest-entry eviction and expiry.
+  Alerts may be dropped under load; investigate using logs and database history.
+- Reload while reports are queued: old queued alerts must be discarded. Confirm
+  movement continues and no kick, ban, correction or synchronous SQL is introduced
+  into movement handling by the alert feature.
 
 Before adding enforcement, the module needs broader client testing, an explicit
 correction strategy, a retention policy, tighter authoritative movement

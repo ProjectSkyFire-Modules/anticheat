@@ -17,10 +17,15 @@ class MovementMonitor
 {
 public:
     void Reset() { initialized = false; }
+    double Distance() const { return distance; }
+    double Allowance() const { return allowance; }
+    std::uint64_t Elapsed() const { return elapsed; }
 
     bool Observe(std::uint64_t now, double x, double y, double speed,
         double slack, double multiplier, std::uint64_t maximumGap)
     {
+        distance = allowance = 0;
+        elapsed = 0;
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(speed) || speed < 0)
         {
             Reset();
@@ -38,10 +43,13 @@ public:
             return false;
         }
 
-        budget = std::min(capacity, budget + speed * multiplier * (now - lastTime) / 1000.0);
+        elapsed = now - lastTime;
+        budget = std::min(capacity, budget + speed * multiplier * elapsed / 1000.0);
+        allowance = budget;
         double dx = x - lastX;
         double dy = y - lastY;
-        budget -= std::sqrt(dx * dx + dy * dy);
+        distance = std::sqrt(dx * dx + dy * dy);
+        budget -= distance;
         lastTime = now;
         lastX = x;
         lastY = y;
@@ -57,6 +65,9 @@ private:
     double lastX = 0;
     double lastY = 0;
     double budget = 0;
+    double distance = 0;
+    double allowance = 0;
+    std::uint64_t elapsed = 0;
 };
 }
 #endif

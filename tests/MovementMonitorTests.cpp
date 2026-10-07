@@ -3,6 +3,7 @@
 * See LICENSE.md file for Copyright information
 */
 #include "../src/MovementMonitor.h"
+#include "../src/AlertQueue.h"
 #include "../src/ClientClockMonitor.h"
 #include "../src/ModuleConfig.h"
 #include "../src/ReportValues.h"
@@ -21,6 +22,19 @@ void Require(bool success, char const* message)
 
 int main()
 {
+    SkyFireAnticheat::AlertQueue alerts;
+    Require(alerts.Take(0).empty(), "empty alert queue");
+    for (unsigned i = 0; i < 105; ++i)
+        alerts.Push(1000, std::to_string(i));
+    auto batch = alerts.Take(1000);
+    Require(batch.size() == 5 && batch.front() == "5" && batch.back() == "9", "bounded queue and delivery batch");
+    Require(alerts.Take(11001).empty(), "stale alerts expire");
+    alerts.Push(12000, "cleared");
+    alerts.Clear();
+    Require(alerts.Take(12000).empty(), "explicit alert clear");
+    alerts.Push(15000, "future");
+    Require(alerts.Take(14000).empty(), "clock regression discards alerts");
+
     SkyFireAnticheat::ClientClockMonitor normalClock;
     SkyFireAnticheat::ClientClockMonitor fastClock;
     SkyFireAnticheat::ClientClockMonitor wrappedClock;
@@ -32,6 +46,7 @@ int main()
         clockDetected = fastClock.Observe(i * 1000, i * 3000, 5000, 10000, 1.5, 2000) || clockDetected;
     }
     Require(clockDetected, "accelerated client clock");
+    Require(fastClock.ClientElapsed() == 30000 && fastClock.ServerElapsed() == 10000, "clock report evidence");
     normalClock.Reset();
     Require(!normalClock.Observe(100000, 500000, 5000, 10000, 1.5, 2000), "clock reset baseline");
     Require(!normalClock.Observe(120000, 900000, 5000, 10000, 1.5, 2000), "clock long-gap reset");
@@ -74,6 +89,7 @@ int main()
     Require(!burst.Observe(0, 0, 0, 7, 10, 1.3, 5000), "baseline");
     Require(!burst.Observe(1000, 7, 0, 7, 10, 1.3, 5000), "batched packets");
     Require(burst.Observe(1000, 30, 0, 7, 10, 1.3, 5000), "same-time displacement");
+    Require(burst.Distance() == 23 && burst.Allowance() == 3 && burst.Elapsed() == 0, "speed report evidence");
     Require(!burst.Observe(1100, 30.7, 0, 7, 10, 1.3, 5000), "reports must not poison the next sample");
     burst.Reset();
     Require(!burst.Observe(1200, 10000, 10000, 7, 10, 1.3, 5000), "authorized teleport reset");

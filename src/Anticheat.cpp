@@ -3,6 +3,7 @@
 * See LICENSE.md file for Copyright information
 */
 #include "MovementMonitor.h"
+#include "AlertQueue.h"
 #include "ClientClockMonitor.h"
 #include "ModuleConfig.h"
 #include "ReportValues.h"
@@ -16,11 +17,14 @@
 #include "ScriptMgr.h"
 #include "SpellAuraDefines.h"
 #include "WorldSession.h"
+#include "World.h"
 #include <array>
 #include <chrono>
 #include <ctime>
 #include <limits>
 #include <mutex>
+#include <sstream>
+#include <cstring>
 #include <unordered_map>
 
 namespace
@@ -77,6 +81,7 @@ struct Settings
     bool waterWalk = false;
     bool database = false;
     bool clientClock = false;
+    bool alerts = true;
     double clockRatio = 1.5;
     uint32 clockWindow = 10000;
     uint32 clockSlack = 2000;
@@ -101,6 +106,8 @@ struct State
 std::mutex Mutex;
 Settings Options;
 std::unordered_map<uint64, State> Players;
+std::unordered_map<uint32, uint64> AlertSubscribers;
+SkyFireAnticheat::AlertQueue Alerts;
 
 uint32 ReadDuration(char const* key, int fallback, int minimum, int maximum)
 {
@@ -117,6 +124,42 @@ class AnticheatWorld : public WorldScript
 {
 public:
     AnticheatWorld() : WorldScript("module_anticheat_world") { }
+    void OnUpdate(uint32 diff) override
+    {
+        // Session access and chat delivery stay off movement/map threads.
+        if (diff < alertTimer)
+        {
+            alertTimer -= diff;
+            return;
+        }
+        alertTimer = 1000;
+        std::vector<std::string> batch;
+        std::unordered_map<uint32, uint64> subscribers;
+        {
+            std::lock_guard<std::mutex> lock(Mutex);
+            if (!Options.enabled || !Options.alerts || AlertSubscribers.empty())
+            {
+                Alerts.Clear();
+                return;
+            }
+            batch = Alerts.Take(Now());
+            subscribers = AlertSubscribers;
+        }
+        if (batch.empty())
+            return;
+        for (auto const& subscriber : subscribers)
+        {
+            WorldSession* session = sWorld->FindSession(subscriber.first);
+            if (!session || !session->GetPlayer() || !session->GetPlayer()->IsInWorld() ||
+                session->GetPlayer()->GetGUID() != subscriber.second ||
+                session->GetSecurity() < AccountTypes::SEC_ADMINISTRATOR ||
+                !session->HasPermission(rbac::RBAC_PERM_COMMAND_SERVER_INFO))
+                continue;
+            ChatHandler handler(session);
+            for (std::string const& message : batch)
+                handler.SendSysMessage(message.c_str());
+        }
+    }
     void OnConfigLoad(bool /*reload*/) override
     {
         // Resolve against the main config, not the process working directory.
@@ -152,6 +195,7 @@ public:
         next.latency = ReadDuration("Anticheat.MaximumLatencyMs", 1000, 100, 10000);
         next.cooldown = ReadDuration("Anticheat.ReportCooldownMs", 10000, 1000, 600000);
         next.clientClock = sConfigMgr->GetBoolDefault("Anticheat.ClientClock", false);
+        next.alerts = sConfigMgr->GetBoolDefault("Anticheat.Alerts", true);
         next.clockRatio = ReadNumber("Anticheat.ClockRatio", 1.5f, 1.1, 5.0);
         next.clockWindow = ReadDuration("Anticheat.ClockWindowMs", 10000, 5000, 60000);
         next.clockSlack = ReadDuration("Anticheat.ClockSlackMs", 2000, 500, 10000);
@@ -168,6 +212,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(Mutex);
             Options = next;
+            Alerts.Clear();
             for (auto& entry : Players)
             {
                 entry.second.movement.Reset();
@@ -178,6 +223,8 @@ public:
         SF_LOG_INFO("server.loading", "Anticheat module: %s (report-only; config %s)",
             next.enabled ? "enabled" : "disabled", loaded ? "loaded" : "missing or invalid");
     }
+private:
+    uint32 alertTimer = 1000;
 };
 
 void Grace(Player* player, uint32 duration = 0)
@@ -201,11 +248,13 @@ public:
         State& state = Players[player->GetGUID()];
         state = State();
         state.graceUntil = Now() + Options.grace;
+        AlertSubscribers.erase(player->GetSession()->GetAccountId());
     }
     void OnLogout(Player* player) override
     {
         std::lock_guard<std::mutex> lock(Mutex);
         Players.erase(player->GetGUID());
+        AlertSubscribers.erase(player->GetSession()->GetAccountId());
     }
     void OnMapChanged(Player* player) override { Grace(player); }
     void OnMovementChanged(Player* player, Unit* mover, PlayerMovementChange /*change*/) override
@@ -232,6 +281,9 @@ public:
         std::array<bool, DetectionCount> emitted{};
         std::array<uint32, DetectionCount> counts{};
         bool database = false;
+        double distance = 0, allowance = 0;
+        uint64 elapsed = 0, clockServer = 0;
+        uint32 clockClient = 0;
         {
             std::lock_guard<std::mutex> lock(Mutex);
             if (!Options.enabled)
@@ -273,6 +325,11 @@ public:
                 Options.clientClock && state.clock.Observe(now, movement.time, Options.gap,
                     Options.clockWindow, Options.clockRatio, Options.clockSlack)
             };
+            distance = state.movement.Distance();
+            allowance = state.movement.Allowance();
+            elapsed = state.movement.Elapsed();
+            clockServer = state.clock.ServerElapsed();
+            clockClient = state.clock.ClientElapsed();
             for (unsigned i = 0; i < DetectionCount; ++i)
                 if (suspicious[i] && (!state.lastReport[i] || now - state.lastReport[i] >= Options.cooldown))
                 {
@@ -281,6 +338,13 @@ public:
                         ++state.reports[i];
                     emitted[i] = true;
                     counts[i] = state.reports[i];
+                    if (Options.alerts && !AlertSubscribers.empty())
+                    {
+                        std::ostringstream message;
+                        message << "[Anticheat report-only] GUID=" << player->GetGUIDLow()
+                            << " " << Names[i] << " count=" << counts[i] << " map=" << player->GetMapId();
+                        Alerts.Push(now, message.str());
+                    }
                 }
         }
         // Avoid holding module state while logging. No chat content, credentials or IPs.
@@ -289,6 +353,12 @@ public:
             {
                 SF_LOG_WARN("anticheat", "Report-only: guid=%u detector=%s count=%u map=%u opcode=%u",
                     player->GetGUIDLow(), Names[i], counts[i], player->GetMapId(), uint32(opcode));
+                if (i == Speed)
+                    SF_LOG_WARN("anticheat", "Speed evidence: guid=%u distance=%.3f yd allowance=%.3f yd elapsed=" UI64FMTD " ms latency=%u ms",
+                        player->GetGUIDLow(), distance, allowance, elapsed, player->GetSession()->GetLatency());
+                else if (i == ClientClock)
+                    SF_LOG_WARN("anticheat", "Clock evidence: guid=%u client=%u ms server=" UI64FMTD " ms latency=%u ms",
+                        player->GetGUIDLow(), clockClient, clockServer, player->GetSession()->GetLatency());
                 if (database)
                     CharacterDatabase.PExecute(
                         "INSERT INTO mod_anticheat_reports "
@@ -314,6 +384,7 @@ public:
             { "player", rbac::RBAC_PERM_COMMAND_SERVER_INFO, false, &Reports, "" },
             { "history", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, &History, "" },
             { "top", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, &Top, "" },
+            { "alerts", rbac::RBAC_PERM_COMMAND_SERVER_INFO, false, &SetAlerts, "" },
             { "clear", rbac::RBAC_PERM_COMMAND_SERVER_INFO, false, &Clear, "" }
         };
         return { { "anticheat", rbac::RBAC_PERM_COMMAND_SERVER_INFO, true, NULL, "", commands } };
@@ -343,6 +414,33 @@ public:
         handler->PSendSysMessage("Module config serial: installed=%u expected=%u.",
             options.configVersion, SkyFireAnticheat::ConfigVersion);
         handler->PSendSysMessage("Client clock detection=%u (report-only).", uint32(options.clientClock));
+        handler->PSendSysMessage("Administrator alerts available=%u; use .anticheat alerts on to subscribe.", uint32(options.alerts));
+        return true;
+    }
+    static bool SetAlerts(ChatHandler* handler, char const* args)
+    {
+        if (!Admin(handler) || !handler->GetSession() || !handler->GetSession()->GetPlayer())
+            return false;
+        if (!args || (std::strcmp(args, "on") && std::strcmp(args, "off")))
+        {
+            handler->SendSysMessage("Usage: .anticheat alerts on|off (this login session only)");
+            return false;
+        }
+        bool enable = !std::strcmp(args, "on");
+        bool available;
+        {
+            std::lock_guard<std::mutex> lock(Mutex);
+            available = Options.enabled && Options.alerts;
+            uint32 account = handler->GetSession()->GetAccountId();
+            if (enable && available)
+                AlertSubscribers[account] = handler->GetSession()->GetPlayer()->GetGUID();
+            else
+                AlertSubscribers.erase(account);
+            if (AlertSubscribers.empty())
+                Alerts.Clear();
+        }
+        handler->SendSysMessage(enable ? (available ? "Anticheat alerts enabled for this session." :
+            "Alerts unavailable: monitoring or Anticheat.Alerts is disabled.") : "Anticheat alerts disabled.");
         return true;
     }
     static bool Top(ChatHandler* handler, char const* /*args*/)

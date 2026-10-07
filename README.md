@@ -65,6 +65,14 @@ removes the feature; retained reports remain available in the character database
   configuration reload resets movement baselines while retaining counts.
 - Log messages use category `anticheat` at WARN level. Configure a dedicated
   core log appender if desired; the core's logger configuration controls output.
+- Speed logs include distance, remaining distance allowance, elapsed server time
+  and latency. Clock logs include client/server elapsed time and latency. These
+  details accompany the summary log; the existing database row format is unchanged.
+- Administrators can opt into live chat alerts for their current login session.
+  Delivery runs on the world thread and rechecks administrator security and RBAC.
+  A shared queue holds at most 100 alerts, drops the oldest on overflow, expires
+  entries after ten seconds and delivers at most five per second per subscriber.
+  These limits affect chat only, not the existing report log/database path.
 
 No packet rejection, teleport correction, jail, kick or ban is performed. A report
 is evidence to investigate, not proof of cheating. Speed checks use a conservative
@@ -86,6 +94,12 @@ permission. Console can run status, history and top; player/clear require a sess
 | `.anticheat clear` | Clear that player's session reports and reset its baseline; preserve database history |
 | `.anticheat history <GUID>` | Latest 10 persisted reports for a character's numeric low GUID, including offline characters |
 | `.anticheat top` | Top ten current-session report totals, with per-detector counts; available in console |
+| `.anticheat alerts on\|off` | Subscribe/unsubscribe to administrator chat alerts for this login session |
+
+`Anticheat.Alerts=1` allows subscriptions but does not automatically subscribe
+anyone. Logout removes the subscription. Set it to 0 to stop alert delivery
+globally. Configuration reload clears queued alerts; subscriptions remain for
+the current session and resume if monitoring and alerts are re-enabled.
 
 ## Optional persistent history
 
@@ -129,6 +143,8 @@ Tests cover normal running, sustained excessive speed, batching, zero elapsed
 time, resets, stalls, clock regression, invalid samples and bounded idle credit.
 Additional cases cover client-clock acceleration, timestamp wraparound, batching,
 report argument boundaries and configuration serial compatibility.
+Alert tests cover capacity, burst limits, expiration, clearing and clock regression;
+evidence tests verify values from the actual detector sample.
 They do not validate the worldserver adapter or packet behavior; build the module
 with the core and follow [the live test checklist](doc/Testing.md).
 
